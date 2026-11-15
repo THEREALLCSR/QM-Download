@@ -1,41 +1,59 @@
-# Gradle / Kotlin
+# ===== Gradle / Kotlin / build =====
 .gradle/
 .kotlin/
 build/
 **/build/
 !gradle/wrapper/gradle-wrapper.jar
 
-# IDE
+# ===== IDE / local machine =====
 .idea/
+.vscode/
 *.iml
 *.ipr
 *.iws
-
-# Local machine configuration
 local.properties
 
-# Runtime data (QQ cookie / tasks / logs)
-desktopApp/data/
-**/data/session.properties
-**/data/tasks.json
-**/data/logs/
+# ===== Runtime data (QQ cookie / tasks / logs) =====
+**/data/
+**/logs/
 **/*.log
+**/*.part
+**/*.part.*
 
-# Signing secrets
+# ===== Signing / credentials / secrets =====
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.der
+*.csr
 keystore.properties
 **/keystore.properties
+.env
+.env.*
+**/secrets*
+**/credentials*
 
-# Release artifacts
+# Keystore template is intentionally tracked
+!**/keystore.properties.example
+
+# ===== Release / binary artifacts =====
 dist/
 *.apk
 *.aab
 *.msi
 *.exe
 *.zip
+*.7z
+*.dmg
+*.tmp
+*.bak
+*.backup
 
-# OS
+# ===== OS =====
 .DS_Store
 Thumbs.db
 desktop.ini
