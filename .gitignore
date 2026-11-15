@@ -1,0 +1,41 @@
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+build/
+**/build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Local machine configuration
+local.properties
+
+# Runtime data (QQ cookie / tasks / logs)
+desktopApp/data/
+**/data/session.properties
+**/data/tasks.json
+**/data/logs/
+**/*.log
+
+# Signing secrets
+*.jks
+*.keystore
+keystore.properties
+**/keystore.properties
+
+# Release artifacts
+dist/
+*.apk
+*.aab
+*.msi
+*.exe
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
