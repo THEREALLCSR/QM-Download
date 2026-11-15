@@ -2,6 +2,8 @@
 
 QQ 音乐歌单下载器，支持 **Windows 便携版** 和 **Android**。
 
+GitHub：<https://github.com/THEREALLCSR/QM-Download>
+
 基于 NeriPlayer 的 QQ 音乐登录、歌单读取和下载能力重新实现，专注做一件事：把账号里的歌单稳定、完整地下载到本地。
 
 > 当前版本：**v0.5**
