@@ -8,7 +8,8 @@ GitHub：<https://github.com/THEREALLCSR/QM-Download>
 
 > 当前版本：**v0.5**
 >
-> 发布包请从仓库的 **Releases** 页面下载。源码仓库不包含 APK / EXE / MSI 等二进制产物。
+> 发布包请从 **Releases** 下载：<https://github.com/THEREALLCSR/QM-Download/releases/tag/v0.5>  
+> 源码仓库不包含 APK / EXE / MSI 等二进制产物。
 
 ---
 
@@ -141,11 +142,13 @@ D:\Music
 
 ### Windows
 
-从 Releases 下载：
+从 **v0.5 Release** 下载：
 
 ```text
 QM-Download-v0.5-win-x64-portable.zip
 ```
+
+下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.5/QM-Download-v0.5-win-x64-portable.zip>
 
 1. 解压到任意目录；
 2. 双击 `QM-Download.exe`；
@@ -158,15 +161,19 @@ QM-Download-v0.5-win-x64-portable.zip
 QM-Download-v0.5-x64.msi
 ```
 
+下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.5/QM-Download-v0.5-x64.msi>
+
 便携版和 MSI 目前没有商业代码签名证书，Windows 首次运行可能出现 SmartScreen 提示。
 
 ### Android
 
-从 Releases 下载：
+从 **v0.5 Release** 下载：
 
 ```text
 QM-Download-v0.5.apk
 ```
+
+下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.5/QM-Download-v0.5.apk>
 
 - 最低 Android 8.0（API 28）；
 - 如之前安装的是 debug 包，需要先卸载再安装正式包（签名不同）；
