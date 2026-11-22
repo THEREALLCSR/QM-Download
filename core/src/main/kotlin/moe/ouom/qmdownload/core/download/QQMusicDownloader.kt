@@ -26,6 +26,8 @@ data class DownloadOptions(
     val maxConnections: Int = 2,
     val minFileBytes: Long = 8L * 1024L * 1024L,
     val maxAttempts: Int = 4,
+    /** 全局字节限速器；所有并行任务/分段共用同一实例时总带宽受控。null = 不限速。 */
+    val limiter: ByteRateLimiter? = null,
 )
 
 /**
@@ -125,7 +127,7 @@ class QQMusicDownloader(private val httpClient: OkHttpClient) {
         var lastError: Exception? = null
         repeat(options.maxAttempts.coerceAtLeast(1)) { attempt ->
             try {
-                transferWithResume(url, part, onProgress)
+                transferWithResume(url, part, options.limiter, onProgress)
                 if (part.length() <= 0L) throw IOException("下载内容为空")
                 return commit(part, target)
             } catch (cancelled: CancellationException) {
@@ -248,6 +250,7 @@ class QQMusicDownloader(private val httpClient: OkHttpClient) {
                                 currentCoroutineContext().ensureActive()
                                 val read = input.read(buffer)
                                 if (read < 0) break
+                                options.limiter?.acquire(read.toLong())
                                 output.write(buffer, 0, read)
                                 offset += read
                                 onBytes(read.toLong())
@@ -275,6 +278,7 @@ class QQMusicDownloader(private val httpClient: OkHttpClient) {
     private suspend fun transferWithResume(
         url: String,
         part: File,
+        limiter: ByteRateLimiter?,
         onProgress: (Long, Long?) -> Unit,
     ) {
         var offset = if (part.exists()) part.length() else 0L
@@ -319,6 +323,7 @@ class QQMusicDownloader(private val httpClient: OkHttpClient) {
                         currentCoroutineContext().ensureActive()
                         val read = input.read(buffer)
                         if (read < 0) break
+                        limiter?.acquire(read.toLong())
                         output.write(buffer, 0, read)
                         downloaded += read
                         onProgress(downloaded, total)

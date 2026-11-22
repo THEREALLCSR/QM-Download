@@ -32,6 +32,14 @@ data class DownloadTaskRecord(
     val retryCount: Int = 0,
     val error: String? = null,
     val updatedAt: Long = System.currentTimeMillis(),
+    /** 所属批次 ID；null = 旧任务，平铺到 target 根。 */
+    val batchId: String? = null,
+    /** 批次内使用的子目录名（歌单名清洗后）。 */
+    val subDir: String? = null,
+    /** 批次内序号，用于稳定展示。 */
+    val seq: Int = 0,
+    /** 是否因登录过期被自动暂停；重新登录后可自动恢复。 */
+    val pausedByAuth: Boolean = false,
 ) {
     fun toTrack(): QQMusicTrack = QQMusicTrack(
         songMid = songMid,
@@ -48,8 +56,12 @@ data class DownloadTaskRecord(
             track: QQMusicTrack,
             quality: String,
             target: String,
+            batchId: String? = null,
+            subDir: String? = null,
+            seq: Int = 0,
         ): DownloadTaskRecord = DownloadTaskRecord(
-            id = "${track.songMid}-$quality",
+            // 批次化后必须把 batchId 纳入 ID，否则同歌跨批次会互相覆盖
+            id = if (batchId == null) "${track.songMid}-$quality" else "$batchId:${track.songMid}:$quality",
             songMid = track.songMid,
             mediaMid = track.mediaMid,
             title = track.title,
@@ -59,6 +71,9 @@ data class DownloadTaskRecord(
             durationMs = track.durationMs,
             quality = quality,
             target = target,
+            batchId = batchId,
+            subDir = subDir,
+            seq = seq,
         )
     }
 }
@@ -130,6 +145,10 @@ class FileDownloadTaskStore(private val file: File) {
         .put("retryCount", task.retryCount)
         .put("error", task.error.orEmpty())
         .put("updatedAt", task.updatedAt)
+        .put("batchId", task.batchId.orEmpty())
+        .put("subDir", task.subDir.orEmpty())
+        .put("seq", task.seq)
+        .put("pausedByAuth", task.pausedByAuth)
 
     private fun decode(json: JSONObject): DownloadTaskRecord = DownloadTaskRecord(
         id = json.optString("id"),
@@ -151,5 +170,10 @@ class FileDownloadTaskStore(private val file: File) {
         retryCount = json.optInt("retryCount", 0),
         error = json.optString("error").takeIf(String::isNotBlank),
         updatedAt = json.optLong("updatedAt", System.currentTimeMillis()),
+        batchId = json.optString("batchId").takeIf(String::isNotBlank),
+        subDir = json.optString("subDir").takeIf(String::isNotBlank),
+        seq = json.optInt("seq", 0),
+        // 旧 JSON 缺该字段时解码为 false，保证向后兼容
+        pausedByAuth = json.optBoolean("pausedByAuth", false),
     )
 }

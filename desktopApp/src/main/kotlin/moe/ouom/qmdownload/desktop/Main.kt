@@ -47,10 +47,12 @@ import androidx.compose.ui.window.rememberWindowState
 import java.io.File
 import java.awt.Desktop
 import java.util.Properties
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import javax.swing.JFileChooser
 import kotlin.system.exitProcess
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -60,19 +62,25 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.supervisorScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import moe.ouom.qmdownload.core.auth.QQMusicQrLoginClient
 import moe.ouom.qmdownload.core.auth.QQMusicQrLoginSession
 import moe.ouom.qmdownload.core.auth.QQMusicQrLoginState
 import moe.ouom.qmdownload.core.auth.QQMusicSessionStore
+import moe.ouom.qmdownload.core.auth.QQMusicSessionRefresher
 import moe.ouom.qmdownload.core.auth.parseQQMusicCookie
 import moe.ouom.qmdownload.core.debug.QmDebugLog
 import moe.ouom.qmdownload.core.download.AudioFileValidator
 import moe.ouom.qmdownload.core.download.AudioTagWriter
+import moe.ouom.qmdownload.core.download.ByteRateLimiter
+import moe.ouom.qmdownload.core.download.DownloadAuthPause
+import moe.ouom.qmdownload.core.download.DownloadBatch
+import moe.ouom.qmdownload.core.download.DownloadBatchPaths
+import moe.ouom.qmdownload.core.download.DownloadBatchStore
 import moe.ouom.qmdownload.core.download.DownloadFileNames
 import moe.ouom.qmdownload.core.download.DownloadOptions
 import moe.ouom.qmdownload.core.download.DownloadTaskRecord
@@ -81,6 +89,7 @@ import moe.ouom.qmdownload.core.download.FileDownloadTaskStore
 import moe.ouom.qmdownload.core.download.QQMusicDownloader
 import moe.ouom.qmdownload.core.error.QmError
 import moe.ouom.qmdownload.core.link.QQMusicShareLinkParser
+import moe.ouom.qmdownload.core.library.PlaylistPaging
 import moe.ouom.qmdownload.core.library.QQMusicLibraryRepository
 import moe.ouom.qmdownload.core.model.QQMusicAccountProfile
 import moe.ouom.qmdownload.core.model.QQMusicPlaylist
@@ -169,6 +178,8 @@ private object AppPaths {
     }
 
     fun configFile(): File = File(dataDir(), "config.properties")
+
+    fun batchesFile(): File = File(dataDir(), "batches.json")
 }
 
 private enum class DesktopTab {
@@ -203,6 +214,10 @@ private fun DesktopApp() {
     val taskStore = remember {
         FileDownloadTaskStore(File(AppPaths.dataDir(), "tasks.json"))
     }
+    val batchStore = remember { DownloadBatchStore(AppPaths.batchesFile()) }
+    var batches by remember { mutableStateOf(batchStore.load()) }
+    var speedLimitKbps by remember { mutableStateOf(loadSpeedLimit()) }
+    val rateLimiter = remember { ByteRateLimiter(loadSpeedLimit() * 1024L) }
     var pendingCount by remember { mutableStateOf(taskStore.pending().size) }
     var tab by remember { mutableStateOf(DesktopTab.LIBRARY) }
     var maxConcurrent by remember { mutableStateOf(loadConcurrency()) }
@@ -212,6 +227,8 @@ private fun DesktopApp() {
     var shareError by remember { mutableStateOf<String?>(null) }
     var shareLoading by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    // 续签串行锁：启动自检、定时检查与 AuthExpired 兜底可能并发触发，避免同一 refresh_token 被并发使用
+    val refreshMutex = remember { Mutex() }
 
     val library = remember(client) { QQMusicLibraryRepository(client) { session } }
     val profileRepo = remember(client) { QQMusicProfileRepository(client) }
@@ -229,8 +246,46 @@ private fun DesktopApp() {
         loading = false
     }
 
+    /**
+     * 登录态自检与续签（启动自检 / 定时检查 / AuthExpired 兜底三处共用）。
+     *
+     * - 始终从 sessionStore 读最新 cookie，不只依赖 Compose 快照；
+     * - 非 force 时只在临近 keyst 过期（约 20h）才续签；force 用于 AuthExpired 兜底强行续签一次；
+     * - 成功：校验 isLoggedIn -> 持久化 -> 更新 Compose 状态 -> 给出友好提示；
+     * - 失败：一律降级——保留原 session 不动，让后续接口自然报 AuthExpired 并提示重新扫码；
+     *   绝不因为续签失败就清空 session 或阻止进入主界面。
+     *
+     * @return 本次是否续签成功。
+     */
+    suspend fun ensureSessionFresh(force: Boolean = false): Boolean = refreshMutex.withLock {
+        val stored = sessionStore.load()
+        if (stored == null || !stored.isLoggedIn) return@withLock false
+        val cookie = stored.cookie
+        // 旧 Cookie 缺 psrf_musickey_createtime 时 isNearExpiry 返回 true，正好借续签补齐时间锚点
+        if (!force && !QQMusicSessionRefresher.isNearExpiry(cookie)) return@withLock false
+
+        val newCookie = runCatching { QQMusicSessionRefresher.refresh(cookie, client) }
+            .getOrElse { e ->
+                if (e is CancellationException) throw e
+                QmDebugLog.log("SessionRefresh", "续签失败，保留原登录态：${e.message}")
+                return@withLock false
+            }
+        val newSession = parseQQMusicCookie(newCookie)
+        if (!newSession.isLoggedIn) {
+            QmDebugLog.log("SessionRefresh", "续签响应登录态无效，保留原登录态")
+            return@withLock false
+        }
+        sessionStore.save(newSession)
+        session = newSession
+        downloadStatus = "登录态已自动续期"
+        QmDebugLog.log("SessionRefresh", "登录态自动续期成功")
+        true
+    }
+
     suspend fun downloadOne(id: String, success: AtomicInteger, skipped: AtomicInteger) {
         var task = taskStore.load().firstOrNull { it.id == id } ?: return
+        // 每个任务最多强制续签重试一次，避免续签成功但接口仍拒绝时无限循环
+        var refreshAttempted = false
         if (task.status == DownloadTaskStatus.COMPLETED) return
         taskJobs[id] = currentCoroutineContext()[Job] ?: return
         try {
@@ -246,7 +301,8 @@ private fun DesktopApp() {
                     val track = task.toTrack()
                     downloadStatus = "解析：${track.title}"
                     val resolved = resolver.resolve(track, task.quality)
-                    val dir = File(task.target)
+                    // 批次任务写入 <target>/<歌单名> 子目录；旧任务仍平铺到 target 根
+                    val dir = task.subDir?.let { File(task.target, it) } ?: File(task.target)
                     dir.mkdirs()
                     val fileName = DownloadFileNames.build(track, resolved.extension)
                     val existing = File(dir, fileName)
@@ -275,6 +331,7 @@ private fun DesktopApp() {
                             segmented = segmented,
                             maxConnections = if (segmented) 2 else 1,
                             maxAttempts = 4,
+                            limiter = rateLimiter,
                         ),
                     ) { done, total ->
                         downloadStatus = if (total != null && total > 0) {
@@ -304,7 +361,9 @@ private fun DesktopApp() {
                     success.incrementAndGet()
                     return
                 } catch (cancelled: CancellationException) {
-                    val part = task.fileName?.let { File(File(task.target), "$it.part") }
+                    // .part 位于任务实际写入目录（批次任务在歌单子目录），取消时按真实路径统计续传字节
+                    val partDir = DownloadBatchPaths.resolveDir(task.target, task.subDir)
+                    val part = task.fileName?.let { File(partDir, "$it.part") }
                     taskStore.upsert(
                         task.copy(
                             status = DownloadTaskStatus.PAUSED,
@@ -314,8 +373,36 @@ private fun DesktopApp() {
                     )
                     return
                 } catch (e: Exception) {
-                    val retryable = e !is QmError.AuthExpired &&
-                        e !is QmError.NoPermission &&
+                    // 登录过期优先处理：先尝试强制续签一次（仍持有 refresh_token 且本任务未强刷过）
+                    if (e is QmError.AuthExpired) {
+                        if (!refreshAttempted &&
+                            sessionStore.load()?.cookie?.contains("psrf_qqrefresh_token=") == true
+                        ) {
+                            refreshAttempted = true
+                            if (ensureSessionFresh(force = true)) {
+                                taskStore.upsert(
+                                    task.copy(
+                                        status = DownloadTaskStatus.QUEUED,
+                                        error = null,
+                                        updatedAt = System.currentTimeMillis(),
+                                    )
+                                )
+                                downloadStatus = "登录态已续期，重试：${task.title}"
+                                continue
+                            }
+                        }
+                        // 续签失败或无凭据：暂停全部未完成任务（不标 FAILED），等待重新登录后自动恢复
+                        // 登录凭据是全局的，必须整队列暂停，避免其他任务继续撞 AuthExpired
+                        taskStore.save(DownloadAuthPause.pauseAll(taskStore.load()))
+                        tasks = taskStore.load()
+                        val pausedCount = DownloadAuthPause.resumable(tasks).size
+                        downloadStatus = "登录已过期，已暂停 $pausedCount 个任务，重新登录后将自动继续"
+                        error = "登录已过期，任务已暂停"
+                        QmDebugLog.log("Download", "AuthExpired：已暂停 $pausedCount 个任务，等待重新登录")
+                        return
+                    }
+                    // 非登录类错误：保持既有自动重试 / FAILED 逻辑（AuthExpired 已在上面 return）
+                    val retryable = e !is QmError.NoPermission &&
                         e !is QmError.NoResource &&
                         task.retryCount < MAX_RETRIES
                     if (retryable) {
@@ -345,7 +432,6 @@ private fun DesktopApp() {
                         )
                     )
                     error = "${task.title}：${e.message}"
-                    if (e is QmError.AuthExpired) downloadStatus = "登录过期，请重新登录"
                     return
                 }
             }
@@ -361,19 +447,53 @@ private fun DesktopApp() {
         val skipped = AtomicInteger(0)
         try {
             supervisorScope {
-                val semaphore = Semaphore(maxConcurrent.coerceIn(1, 6))
-                val jobs = ids.map { id ->
-                    async { semaphore.withPermit { downloadOne(id, success, skipped) } }
-                }
-                jobs.forEach { job ->
-                    runCatching { job.await() }
+                // 待启动任务（保持调用方传入的顺序与批次隔离）
+                val pendingIds = ids.toMutableList()
+                var nextIndex = 0
+                val activeJobs = mutableListOf<Job>()
+                // 每轮循环都重新读取 maxConcurrent：下载过程中调大/调小并发数，
+                // 只对"尚未启动"的任务生效，已启动的任务不中断（暂停/取消仍走原逻辑）
+                while (nextIndex < pendingIds.size || activeJobs.isNotEmpty()) {
+                    activeJobs.removeAll { it.isCompleted }
+                    // 每轮读一次当前状态：登录过期暂停后剩余任务已是 PAUSED，不能被重新拉起
+                    val statusById = taskStore.load().associate { it.id to it.status }
+                    val slots = (maxConcurrent.coerceIn(1, 6) - activeJobs.size).coerceAtLeast(0)
+                    var launched = 0
+                    while (nextIndex < pendingIds.size && launched < slots) {
+                        val id = pendingIds[nextIndex++]
+                        // 仅仍为 QUEUED 的任务才启动并占用并发槽；非 QUEUED 直接跳过且不占槽
+                        if (statusById[id] == DownloadTaskStatus.QUEUED) {
+                            activeJobs += async { downloadOne(id, success, skipped) }
+                            launched++
+                        }
+                    }
+                    if (activeJobs.isNotEmpty()) {
+                        // 短轮询：等待任务完成的同时，让并发数调大后能尽快补满空位
+                        delay(150L)
+                    }
                 }
             }
-            downloadStatus = "完成 ${success.get()}，跳过 ${skipped.get()}"
+            // 若仍有因登录过期暂停的任务，保留“已暂停”提示，不用“完成 x，跳过 y”覆盖
+            if (DownloadAuthPause.resumable(taskStore.load()).isEmpty()) {
+                downloadStatus = "完成 ${success.get()}，跳过 ${skipped.get()}"
+            }
         } finally {
             downloading = false
             downloadJob = null
             pendingCount = taskStore.pending().size
+        }
+    }
+
+    // A. 启动时登录态自检与续签：失败会降级保留原 session，不阻断进入主界面
+    LaunchedEffect(Unit) {
+        ensureSessionFresh()
+    }
+
+    // B. 前台运行期间每 6 小时检查一次，避免长时间运行跨过 keyst 过期点
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(6 * 60 * 60 * 1000L)
+            ensureSessionFresh()
         }
     }
 
@@ -433,6 +553,24 @@ private fun DesktopApp() {
                         sessionStore.save(parsed)
                         session = parsed
                         qrStatus = "登录成功"
+                        // 登录恢复：把因登录过期自动暂停的任务恢复并自动继续下载
+                        val before = taskStore.load()
+                        val resumed = DownloadAuthPause.resumable(before)
+                        if (resumed.isNotEmpty()) {
+                            taskStore.save(DownloadAuthPause.resumeAll(before))
+                            tasks = taskStore.load()
+                            pendingCount = taskStore.pending().size
+                            tab = DesktopTab.DOWNLOADS
+                            downloadStatus = "登录已恢复，继续下载 ${resumed.size} 个任务"
+                            val previous = downloadJob
+                            downloadJob = scope.launch {
+                                previous?.join()
+                                // 旧队列 finally 可能已把 downloadJob 置空，这里补回当前新 job，
+                                // 确保“全部暂停/退出登录”能取消到它
+                                downloadJob = coroutineContext[Job]
+                                runQueue(resumed.map { it.id })
+                            }
+                        }
                         break
                     }
                     QQMusicQrLoginState.Scanned -> qrStatus = "已扫码，请在手机上确认"
@@ -477,8 +615,13 @@ private fun DesktopApp() {
             selectedSongMids = emptySet()
             scope.launch {
                 loading = true
+                error = null
                 runCatching {
-                    tracks = library.playlistTracksPage(playlist.id).tracks
+                    // 完整加载整首歌单（按 total 翻页 + songMid 去重），全选才不会被单页 99 首封顶
+                    tracks = library.allPlaylistTracks(playlist.id)
+                    if (tracks.size >= PlaylistPaging.MAX_TRACKS) {
+                        error = "歌单较大，已按上限加载 ${tracks.size} 首"
+                    }
                 }.onFailure { error = it.message }
                 loading = false
             }
@@ -532,17 +675,21 @@ private fun DesktopApp() {
                 shareLoading = true
                 shareError = null
                 runCatching {
-                    val page = library.playlistTracksPage(playlistId)
+                    // 分享歌单同样完整翻页加载，避免只能选到第一页的 99 首
+                    val loaded = library.allPlaylistTracks(playlistId)
                     selected = QQMusicPlaylist(
                         id = playlistId,
                         dirId = 0L,
                         title = "分享歌单 $playlistId",
                         coverUrl = null,
-                        trackCount = page.total,
+                        trackCount = loaded.size,
                         isOwn = false,
                     )
-                    tracks = page.tracks
+                    tracks = loaded
                     selectedSongMids = emptySet()
+                    if (loaded.size >= PlaylistPaging.MAX_TRACKS) {
+                        shareError = "歌单较大，已按上限加载 ${loaded.size} 首"
+                    }
                 }.onFailure { shareError = it.message }
                 shareLoading = false
             }
@@ -554,10 +701,23 @@ private fun DesktopApp() {
             val dir = downloadDir
             val chosen = tracks.filter { it.songMid in selectedSongMids }
             if (dir == null || chosen.isEmpty() || downloading) return@HomeScreen
-            val records = chosen.map {
-                DownloadTaskRecord.fromTrack(it, qualityKey, dir.absolutePath)
+            // 一次提交 = 一个批次；selected 可能为 null（如异常场景），做兜底
+            val batch = DownloadBatch(
+                id = UUID.randomUUID().toString(),
+                playlistId = selected?.id,
+                playlistTitle = selected?.title ?: "未命名歌单",
+                subDir = DownloadBatchPaths.subDirName(selected?.title ?: ""),
+                rootTarget = dir.absolutePath,
+                quality = qualityKey,
+                total = chosen.size,
+            )
+            val records = chosen.mapIndexed { i, t ->
+                DownloadTaskRecord.fromTrack(t, qualityKey, dir.absolutePath, batch.id, batch.subDir, i)
             }
+            batchStore.upsert(batch)
+            batches = batchStore.load()
             val recordIds = records.map { it.id }.toSet()
+            // 新 ID 已含 batchId，filterNot 不会误删其他批次的任务
             taskStore.save(
                 taskStore.load().filterNot { it.id in recordIds } + records
             )
@@ -586,11 +746,22 @@ private fun DesktopApp() {
     } else {
         DesktopDownloadsScreen(
             tasks = tasks,
+            batches = batches,
+            authPausedCount = tasks.count {
+                it.status == DownloadTaskStatus.PAUSED && it.pausedByAuth
+            },
             downloading = downloading,
             maxConcurrent = maxConcurrent,
             onMaxConcurrentChange = {
                 maxConcurrent = it
                 saveConcurrency(it)
+            },
+            speedLimitKbps = speedLimitKbps,
+            // 选择即改共享限速器速率，对正在下载的任务立即生效，并持久化配置
+            onSpeedLimitChange = { kbps ->
+                speedLimitKbps = kbps
+                rateLimiter.setRate(kbps * 1024L)
+                saveSpeedLimit(kbps)
             },
             onBack = { tab = DesktopTab.LIBRARY },
             onPauseAll = {
@@ -608,7 +779,12 @@ private fun DesktopApp() {
                         val ids = pending.map { it.id }.toSet()
                         taskStore.save(
                             taskStore.load().map {
-                                if (it.id in ids) it.copy(status = DownloadTaskStatus.QUEUED) else it
+                                if (it.id in ids) {
+                                    // 手动继续：清掉自动暂停标记，避免重复自动恢复
+                                    DownloadAuthPause.clearPausedByAuth(
+                                        it.copy(status = DownloadTaskStatus.QUEUED)
+                                    )
+                                } else it
                             }
                         )
                         pendingCount = pending.size
@@ -622,14 +798,23 @@ private fun DesktopApp() {
                     job.cancel()
                 } else {
                     taskStore.load().firstOrNull { it.id == id }?.let {
-                        taskStore.upsert(it.copy(status = DownloadTaskStatus.PAUSED))
+                        // 手动暂停：清掉自动暂停标记，避免重新登录时被自动恢复
+                        taskStore.upsert(
+                            DownloadAuthPause.clearPausedByAuth(
+                                it.copy(status = DownloadTaskStatus.PAUSED)
+                            )
+                        )
                     }
                 }
                 tasks = taskStore.load()
             },
             onResumeTask = { id ->
                 taskStore.load().firstOrNull { it.id == id }?.let {
-                    taskStore.upsert(it.copy(status = DownloadTaskStatus.QUEUED))
+                    taskStore.upsert(
+                        DownloadAuthPause.clearPausedByAuth(
+                            it.copy(status = DownloadTaskStatus.QUEUED)
+                        )
+                    )
                     if (taskJobs[id] == null) {
                         scope.launch {
                             downloadOne(id, AtomicInteger(0), AtomicInteger(0))
@@ -641,10 +826,12 @@ private fun DesktopApp() {
             onRetryTask = { id ->
                 taskStore.load().firstOrNull { it.id == id }?.let {
                     taskStore.upsert(
-                        it.copy(
-                            status = DownloadTaskStatus.QUEUED,
-                            error = null,
-                            retryCount = 0,
+                        DownloadAuthPause.clearPausedByAuth(
+                            it.copy(
+                                status = DownloadTaskStatus.QUEUED,
+                                error = null,
+                                retryCount = 0,
+                            )
                         )
                     )
                     if (taskJobs[id] == null) {
@@ -658,9 +845,11 @@ private fun DesktopApp() {
             onRemoveTask = { id ->
                 taskJobs[id]?.cancel()
                 taskStore.load().firstOrNull { it.id == id }?.let { task ->
+                    // .part 位于任务实际写入目录（批次任务在歌单子目录）
+                    val taskDir = DownloadBatchPaths.resolveDir(task.target, task.subDir)
                     task.fileName?.let { name ->
-                        File(task.target, "$name.part").delete()
-                        File(task.target).listFiles()?.forEach { file ->
+                        File(taskDir, "$name.part").delete()
+                        File(taskDir).listFiles()?.forEach { file ->
                             if (file.name.startsWith("$name.part.")) file.delete()
                         }
                     }
@@ -670,7 +859,89 @@ private fun DesktopApp() {
                 pendingCount = taskStore.pending().size
             },
             onOpenFolder = { task ->
-                runCatching { Desktop.getDesktop().open(File(task.target)) }
+                // 批次任务打开歌单子目录，旧任务打开 target 根
+                val dir = DownloadBatchPaths.resolveDir(task.target, task.subDir)
+                runCatching { Desktop.getDesktop().open(File(dir)) }
+            },
+            // 暂停批次：仅取消该批次任务的 job（supervisorScope 下不影响其他批次）
+            onPauseBatch = { batchId ->
+                taskStore.load().filter { it.batchId == batchId }.forEach { task ->
+                    taskJobs[task.id]?.cancel()
+                    if (task.status == DownloadTaskStatus.QUEUED) {
+                        taskStore.upsert(task.copy(status = DownloadTaskStatus.PAUSED))
+                    }
+                }
+                downloadStatus = "已暂停批次"
+                tasks = taskStore.load()
+                pendingCount = taskStore.pending().size
+            },
+            // 继续批次：把该批次的待处理任务改回 QUEUED 并重新入队
+            onResumeBatch = { batchId ->
+                if (!downloading) {
+                    val pending = taskStore.pending().filter { it.batchId == batchId }
+                    if (pending.isNotEmpty()) {
+                        val ids = pending.map { it.id }.toSet()
+                        taskStore.save(
+                            taskStore.load().map {
+                                if (it.id in ids) {
+                                    // 手动继续：清掉自动暂停标记，避免重复自动恢复
+                                    DownloadAuthPause.clearPausedByAuth(
+                                        it.copy(status = DownloadTaskStatus.QUEUED)
+                                    )
+                                } else it
+                            }
+                        )
+                        pendingCount = taskStore.pending().size
+                        downloadJob = scope.launch { runQueue(pending.map { it.id }) }
+                    }
+                }
+            },
+            // 重试批次：FAILED 任务清空错误、重试计数归零并重新入队
+            onRetryBatch = { batchId ->
+                val failed = taskStore.load().filter {
+                    it.batchId == batchId && it.status == DownloadTaskStatus.FAILED
+                }
+                if (failed.isNotEmpty()) {
+                    val ids = failed.map { it.id }.toSet()
+                    taskStore.save(
+                        taskStore.load().map {
+                            if (it.id in ids) {
+                                // 手动重试：清掉自动暂停标记，避免重复自动恢复
+                                DownloadAuthPause.clearPausedByAuth(
+                                    it.copy(status = DownloadTaskStatus.QUEUED, error = null, retryCount = 0)
+                                )
+                            } else it
+                        }
+                    )
+                    pendingCount = taskStore.pending().size
+                    if (!downloading) {
+                        downloadJob = scope.launch { runQueue(failed.map { it.id }) }
+                    }
+                    tasks = taskStore.load()
+                }
+            },
+            // 删除批次：只删批次记录、任务记录与 .part，不删除已下载的音频文件
+            onRemoveBatch = { batchId ->
+                taskStore.load().filter { it.batchId == batchId }.forEach { task ->
+                    taskJobs[task.id]?.cancel()
+                    val taskDir = DownloadBatchPaths.resolveDir(task.target, task.subDir)
+                    task.fileName?.let { name ->
+                        File(taskDir, "$name.part").delete()
+                        File(taskDir).listFiles()?.forEach { file ->
+                            if (file.name.startsWith("$name.part.")) file.delete()
+                        }
+                    }
+                    taskStore.remove(task.id)
+                }
+                batchStore.remove(batchId)
+                batches = batchStore.load()
+                tasks = taskStore.load()
+                pendingCount = taskStore.pending().size
+                downloadStatus = "已删除批次"
+            },
+            onOpenBatchFolder = { batch ->
+                val dir = DownloadBatchPaths.resolveDir(batch.rootTarget, batch.subDir)
+                runCatching { Desktop.getDesktop().open(File(dir)) }
             },
         )
     }
@@ -918,6 +1189,16 @@ private fun loadConcurrency(): Int = runCatching {
 
 private fun saveConcurrency(count: Int) =
     updateConfig("maxConcurrent", count.coerceIn(1, 6).toString())
+
+/** 限速值以 KB/s 存配置；0 = 不限速，默认 0（不改变现有行为）。 */
+private fun loadSpeedLimit(): Int = runCatching {
+    if (!AppPaths.configFile().exists()) return 0
+    val properties = Properties().apply { AppPaths.configFile().inputStream().use(::load) }
+    properties.getProperty("speedLimitKbps")?.toIntOrNull()?.coerceAtLeast(0) ?: 0
+}.getOrDefault(0)
+
+private fun saveSpeedLimit(kbps: Int) =
+    updateConfig("speedLimitKbps", kbps.coerceAtLeast(0).toString())
 
 private fun updateConfig(key: String, value: String) {
     runCatching {

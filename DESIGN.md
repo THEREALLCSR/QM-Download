@@ -391,12 +391,17 @@ Queued
   - 专辑（ALBUM）
 - 若标签写入失败，仍保留正确文件名，并在 UI 标记“标签未写入”。
 
-**目录约定**
+**目录约定（v0.6 起：批次下载默认按歌单建子目录）**
 
 | 平台 | 默认建议 |
 |---|---|
-| Android | 用户选择的 SAF 目录；如需与官方一致，可在其下创建 `qqmusic/song/` |
-| Windows | 用户选择的下载目录；默认 `文档\QM-Download` |
+| Android | 用户选择的 SAF 目录下，按歌单名建子目录（`DocumentFile.createDirectory`）；旧任务仍平铺 |
+| Windows | 用户选择的下载目录下，按歌单名建子目录；默认 `文档\QM-Download` |
+
+一次“下载所选”= 一个 `DownloadBatch`，记录歌单 id / 标题 / 子目录名 / 目标根 / 音质 / 曲目数。
+任务记录增加 `batchId / subDir / seq`，任务 ID 规则：`batchId != null` 时为 `batchId:songMid:quality`，
+否则沿用旧规则 `songMid-quality`（避免同歌跨批次互相覆盖）。批次存储：
+Desktop `data/batches.json`、Android `filesDir/download_batches.json`。
 
 > 官方 Android 本地目录常量是 `/qqmusic/song`，但本项目**不强制**该路径；
 > 用户选择的目录优先，官方识别依赖标签而非固定目录。

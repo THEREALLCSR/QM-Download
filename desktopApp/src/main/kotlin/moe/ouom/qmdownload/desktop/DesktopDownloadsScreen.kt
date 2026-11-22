@@ -1,5 +1,6 @@
 package moe.ouom.qmdownload.desktop
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,15 +29,21 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import moe.ouom.qmdownload.core.download.DownloadBatch
 import moe.ouom.qmdownload.core.download.DownloadTaskRecord
 import moe.ouom.qmdownload.core.download.DownloadTaskStatus
+import moe.ouom.qmdownload.core.download.completedCount
 
 @Composable
 fun DesktopDownloadsScreen(
     tasks: List<DownloadTaskRecord>,
+    batches: List<DownloadBatch>,
+    authPausedCount: Int,
     downloading: Boolean,
     maxConcurrent: Int,
     onMaxConcurrentChange: (Int) -> Unit,
+    speedLimitKbps: Int,
+    onSpeedLimitChange: (Int) -> Unit,
     onBack: () -> Unit,
     onPauseAll: () -> Unit,
     onResumeAll: () -> Unit,
@@ -45,6 +52,11 @@ fun DesktopDownloadsScreen(
     onRetryTask: (String) -> Unit,
     onRemoveTask: (String) -> Unit,
     onOpenFolder: (DownloadTaskRecord) -> Unit,
+    onPauseBatch: (String) -> Unit,
+    onResumeBatch: (String) -> Unit,
+    onRetryBatch: (String) -> Unit,
+    onRemoveBatch: (String) -> Unit,
+    onOpenBatchFolder: (DownloadBatch) -> Unit,
 ) {
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Row(
@@ -93,9 +105,52 @@ fun DesktopDownloadsScreen(
                 }
             }
         }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text("限速", style = MaterialTheme.typography.bodySmall)
+            var speedExpanded by remember { mutableStateOf(false) }
+            Box {
+                OutlinedButton(onClick = { speedExpanded = true }) {
+                    Text(speedLimitLabel(speedLimitKbps))
+                }
+                DropdownMenu(
+                    expanded = speedExpanded,
+                    onDismissRequest = { speedExpanded = false },
+                ) {
+                    listOf(0, 512, 1024, 2048).forEach { kbps ->
+                        DropdownMenuItem(
+                            text = { Text(speedLimitLabel(kbps)) },
+                            onClick = {
+                                speedExpanded = false
+                                onSpeedLimitChange(kbps)
+                            },
+                        )
+                    }
+                }
+            }
+            Text("限速可降低风控风险，对正在下载的任务立即生效", style = MaterialTheme.typography.bodySmall)
+        }
+        // 登录过期自动暂停提示：醒目警告条，重新登录成功后由 Main 自动恢复
+        if (authPausedCount > 0) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                "登录已过期，已暂停 $authPausedCount 个任务；重新登录后将自动继续",
+                modifier = Modifier.fillMaxWidth()
+                    .background(MaterialTheme.colorScheme.errorContainer)
+                    .padding(10.dp),
+                color = MaterialTheme.colorScheme.onErrorContainer,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
         Spacer(Modifier.height(8.dp))
         HorizontalDivider()
-        if (tasks.isEmpty()) {
+        Text(
+            "删除批次仅移除批次与任务记录（含 .part），不会删除已下载的音频文件",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        if (tasks.isEmpty() && batches.isEmpty()) {
             Text(
                 "暂无下载任务",
                 modifier = Modifier.padding(24.dp),
@@ -103,21 +158,98 @@ fun DesktopDownloadsScreen(
             )
             return@Column
         }
+        val grouped = tasks.groupBy { it.batchId }
+        val orderedBatches = batches.sortedByDescending { it.createdAt }
+        val ungrouped = grouped[null].orEmpty().sortedBy { it.seq }
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(tasks, key = { it.id }) { task ->
-                DownloadTaskRow(
-                    task = task,
-                    onPause = { onPauseTask(task.id) },
-                    onResume = { onResumeTask(task.id) },
-                    onRetry = { onRetryTask(task.id) },
-                    onRemove = { onRemoveTask(task.id) },
-                    onOpenFolder = { onOpenFolder(task) },
-                )
+            // 批次按 createdAt 倒序；组内任务按 seq 升序
+            orderedBatches.forEach { batch ->
+                val batchTasks = grouped[batch.id].orEmpty().sortedBy { it.seq }
+                // 任务下载成功后记录会被删除，列表里没有 COMPLETED 任务，
+                // 故按 batch.total - 该批次剩余任务数估算完成数（remaining 严格按 batchId 过滤）
+                val doneCount = completedCount(batch.total, tasks.count { it.batchId == batch.id })
+                item(key = "batch-${batch.id}") {
+                    BatchHeader(
+                        batch = batch,
+                        doneCount = doneCount,
+                        onPause = { onPauseBatch(batch.id) },
+                        onResume = { onResumeBatch(batch.id) },
+                        onRetry = { onRetryBatch(batch.id) },
+                        onOpenFolder = { onOpenBatchFolder(batch) },
+                        onRemove = { onRemoveBatch(batch.id) },
+                    )
+                }
+                items(batchTasks, key = { it.id }) { task ->
+                    DownloadTaskRow(
+                        task = task,
+                        onPause = { onPauseTask(task.id) },
+                        onResume = { onResumeTask(task.id) },
+                        onRetry = { onRetryTask(task.id) },
+                        onRemove = { onRemoveTask(task.id) },
+                        onOpenFolder = { onOpenFolder(task) },
+                    )
+                }
+            }
+            // batchId == null 的旧版本任务兼容区
+            if (ungrouped.isNotEmpty()) {
+                item(key = "ungrouped-header") {
+                    Text(
+                        "未分组任务（旧版本）",
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+                    )
+                }
+                items(ungrouped, key = { it.id }) { task ->
+                    DownloadTaskRow(
+                        task = task,
+                        onPause = { onPauseTask(task.id) },
+                        onResume = { onResumeTask(task.id) },
+                        onRetry = { onRetryTask(task.id) },
+                        onRemove = { onRemoveTask(task.id) },
+                        onOpenFolder = { onOpenFolder(task) },
+                    )
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun BatchHeader(
+    batch: DownloadBatch,
+    doneCount: Int,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onRetry: () -> Unit,
+    onOpenFolder: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "${batch.playlistTitle} · 完成 $doneCount/${batch.total}",
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                OutlinedButton(onClick = onPause) { Text("暂停批次") }
+                OutlinedButton(onClick = onResume) { Text("继续批次") }
+                OutlinedButton(onClick = onRetry) { Text("重试") }
+                OutlinedButton(onClick = onOpenFolder) { Text("目录") }
+                OutlinedButton(onClick = onRemove) { Text("删除") }
+            }
+        }
+        // 批次整体进度：与文字的 完成 $doneCount/${batch.total} 用同一口径
+        LinearProgressIndicator(
+            progress = if (batch.total > 0) doneCount.toFloat() / batch.total else 0f,
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        )
     }
 }
 
@@ -215,4 +347,12 @@ private fun formatBytes(bytes: Long): String {
     val kb = bytes / 1024.0
     if (kb < 1024) return String.format("%.1fKB", kb)
     return String.format("%.1fMB", kb / 1024.0)
+}
+
+private fun speedLimitLabel(kbps: Int): String = when (kbps) {
+    0 -> "不限"
+    512 -> "512KB/s"
+    1024 -> "1MB/s"
+    2048 -> "2MB/s"
+    else -> "$kbps KB/s"
 }

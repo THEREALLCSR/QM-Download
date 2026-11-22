@@ -4,11 +4,11 @@ QQ 音乐歌单下载器，支持 **Windows 便携版** 和 **Android**。
 
 GitHub：<https://github.com/THEREALLCSR/QM-Download>
 
-基于 NeriPlayer 的 QQ 音乐登录、歌单读取和下载能力重新实现，专注做一件事：把账号里的歌单稳定、完整地下载到本地。
+QQ 音乐登录、歌单读取和下载能力参考 **MeloX-Android** 重新实现，专注做一件事：把账号里的歌单稳定、完整地下载到本地。
 
-> 当前版本：**v0.5**
+> 当前版本：**v0.6**
 >
-> 发布包请从 **Releases** 下载：<https://github.com/THEREALLCSR/QM-Download/releases/tag/v0.5>  
+> 发布包请从 **Releases** 下载：<https://github.com/THEREALLCSR/QM-Download/releases/tag/v0.6>  
 > 源码仓库不包含 APK / EXE / MSI 等二进制产物。
 
 ---
@@ -46,6 +46,15 @@ https://y.qq.com/n/m/detail/taoge.html?disstid=9616026161
 {artist}-{title}.{ext}
 ```
 
+批量下载时，文件放在所选目录的歌单子文件夹下：
+
+```text
+D:\Music\
+  我喜欢\
+    周杰伦-晴天.flac
+    ...
+```
+
 - 自动写入音频标签：
   - TITLE
   - ARTIST
@@ -56,6 +65,9 @@ https://y.qq.com/n/m/detail/taoge.html?disstid=9616026161
 ### 下载管理
 
 - 独立“下载”页，不和歌单操作混在一起；
+- **按歌单分批下载**：一次“下载所选”生成一个批次，文件保存到所选目录下**以歌单命名的子文件夹**；
+- 下载页按批次分组，可对整个歌单暂停 / 继续 / 重试 / 打开目录 / 删除；
+- **下载限速**：不限 / 512KB/s / 1MB/s / 2MB/s，降低触发风控的风险，修改后立即生效；
 - 任务持久化，重启后可以继续；
 - **并行任务数 1–6**，在下载页通过下拉框选择；
 - 单个任务暂停 / 继续 / 重试 / 删除；
@@ -142,13 +154,13 @@ D:\Music
 
 ### Windows
 
-从 **v0.5 Release** 下载：
+从 **v0.6 Release** 下载：
 
 ```text
-QM-Download-v0.5-win-x64-portable.zip
+QM-Download-v0.6-win-x64-portable.zip
 ```
 
-下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.5/QM-Download-v0.5-win-x64-portable.zip>
+下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.6/QM-Download-v0.6-win-x64-portable.zip>
 
 1. 解压到任意目录；
 2. 双击 `QM-Download.exe`；
@@ -158,22 +170,22 @@ QM-Download-v0.5-win-x64-portable.zip
 也提供：
 
 ```text
-QM-Download-v0.5-x64.msi
+QM-Download-v0.6-x64.msi
 ```
 
-下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.5/QM-Download-v0.5-x64.msi>
+下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.6/QM-Download-v0.6-x64.msi>
 
 便携版和 MSI 目前没有商业代码签名证书，Windows 首次运行可能出现 SmartScreen 提示。
 
 ### Android
 
-从 **v0.5 Release** 下载：
+从 **v0.6 Release** 下载：
 
 ```text
-QM-Download-v0.5.apk
+QM-Download-v0.6.apk
 ```
 
-下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.5/QM-Download-v0.5.apk>
+下载地址：<https://github.com/THEREALLCSR/QM-Download/releases/download/v0.6/QM-Download-v0.6.apk>
 
 - 最低 Android 8.0（API 28）；
 - 如之前安装的是 debug 包，需要先卸载再安装正式包（签名不同）；
@@ -264,7 +276,7 @@ desktopApp/build/compose/binaries/main/app/QM-Download
 MSI 输出：
 
 ```text
-desktopApp/build/compose/binaries/main/msi/QM-Download-0.5.0.msi
+desktopApp/build/compose/binaries/main/msi/QM-Download-0.6.0.msi
 ```
 
 ### 测试
@@ -356,10 +368,11 @@ QM-Download/
 
 本项目基于 **GNU General Public License v3.0** 发布，见 [LICENSE](LICENSE)。
 
-QQ 音乐登录、歌单与下载能力的实现参考了 [NeriPlayer](https://github.com/cwuom/NeriPlayer)，在此致谢。
+QQ 音乐登录、歌单与下载能力的实现主要参考了 [MeloX-Android](https://github.com/lladlam/MeloX-Android)，早期部分能力参考了 [NeriPlayer](https://github.com/cwuom/NeriPlayer)，在此致谢。
 
 ## 致谢
 
+- [MeloX-Android](https://github.com/lladlam/MeloX-Android)
 - [NeriPlayer](https://github.com/cwuom/NeriPlayer)
 - [JetBrains Compose Multiplatform](https://www.jetbrains.com/compose-multiplatform/)
 - [OkHttp](https://square.github.io/okhttp/)

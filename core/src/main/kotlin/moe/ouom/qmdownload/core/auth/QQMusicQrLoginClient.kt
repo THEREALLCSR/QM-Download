@@ -380,6 +380,10 @@ internal data class QQMusicCredential(
     val authst: String = "",
     val sid: String = "",
     val wid: String = "",
+    /** keyst 生成时间戳：响应 data.musickeyCreateTime -> Cookie psrf_musickey_createtime。 */
+    val musicKeyCreateTime: String = "",
+    /** access_token 过期时间：响应 data.expired_at -> Cookie psrf_access_token_expiresAt。 */
+    val accessTokenExpiresAt: String = "",
 ) {
     val isUsable: Boolean
         get() = musicId.isNotBlank() && musicKey.isNotBlank()
@@ -397,6 +401,8 @@ internal fun parseCredential(data: JSONObject): QQMusicCredential = QQMusicCrede
     authst = data.optString("authst"),
     sid = data.optString("sid"),
     wid = data.optString("wid").ifBlank { data.optString("str_wid") },
+    musicKeyCreateTime = data.optString("musickeyCreateTime"),
+    accessTokenExpiresAt = data.optString("expired_at"),
 )
 
 /**
@@ -428,6 +434,8 @@ internal fun QQMusicCredential.toCookie(): String {
         "musicid" to musicId,
         "sid" to sid,
         "wid" to wid,
+        "psrf_musickey_createtime" to musicKeyCreateTime,
+        "psrf_access_token_expiresAt" to accessTokenExpiresAt,
     )
         .filter { (_, value) -> value.isNotBlank() && value.none { it == ';' || it == '\r' || it == '\n' } }
         .joinToString("; ") { (key, value) -> "$key=$value" }

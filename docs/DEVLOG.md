@@ -973,3 +973,81 @@ dist/
 - 已在平板完整回归并安装；
 - Windows 便携版/MSI 保持不变；
 - `dist/QM-Download-v0.5.apk` 已替换为优化版。
+
+---
+
+## 2026-11-19 · 全选 99 首修复 + 批次下载 + 全局限速
+
+### 修复：歌单全选封顶 99 首（P0）
+
+- 根因：`playlistTracksPage` 本身支持分页并解析了 `total`，但双端 UI 只调用一次、丢弃 `total`，只取第一页 100 条（过滤无 mid 后 99 条）。
+- core 新增 `PlaylistPaging.loadAll`：注入 `fetchPage` 接缝，按 total 翻页、songMid 去重保序，带空页/无新增/不推进/maxPages/maxTracks 保护；`QQMusicLibraryRepository.allPlaylistTracks` 封装调用。
+- 双端账号歌单与分享歌单加载均改走完整加载。
+- 连带修复：Android 把曲目 JSON 塞 Intent extra 上千首会触发 Binder 1MB 上限，改为写 `pending_tracks` 文件只传路径。
+- 回归测试：`core/.../library/PlaylistPagingTest.kt` 9 例（整歌单 250 首翻页、重叠去重、无 mid 过滤、服务端不推进终止、空页终止、上限钳制等）。
+
+### 新功能：按批次下载 + 歌单子目录
+
+- 一次“下载所选”= 一个 `DownloadBatch`（歌单 id/标题/子目录/根目录/音质/曲目数）。
+- 任务记录新增 `batchId/subDir/seq`；任务 ID 含 batchId，防止同歌跨批次互相覆盖。
+- 默认下载到 `<所选目录>/<歌单名>/`；旧任务（无 batchId）仍平铺，UI 归入“未分组任务”。
+- 下载页按批次分组，支持整批暂停/继续/重试/打开目录/删除（不删已下载音频）。
+- 批次存储：Desktop `data/batches.json`，Android `filesDir/download_batches.json`。
+
+### 新功能：全局下载限速（降低风控风险）
+
+- core 新增 `ByteRateLimiter`（令牌桶，Mutex 保护，delay 可取消，令牌上限 1 秒量），`DownloadOptions.limiter` 注入。
+- 双端下载器的单连接与分段两处字节循环都接入，总带宽受控（不是每任务各自限速）。
+- 两端下载页下拉：不限 / 512KB/s / 1MB/s / 2MB/s，默认不限，运行中切换立即生效并持久化（Desktop `config.properties` 的 `speedLimitKbps`，Android `qm_download_ui` 同名键）。
+
+### 验证
+
+- `:core:compileKotlin :desktopApp:compileKotlin :androidApp:assembleDebug` BUILD SUCCESSFUL（按要求先验证 PC 端）。
+- 单测：`PlaylistPagingTest`、`ByteRateLimiterTest`、`DownloadBatchModelTest`、`QQMusicSessionSupportTest`、`QQMusicShareLinkParserTest` 各类单独运行全部通过。
+- 注意：本机 Gradle 并行/测试 worker 在一次性跑全部测试类时进程被环境终止，逐类运行均通过；真机整歌单端到端未验收（release/debug 签名不同，需用户决定是否卸载重装）。
+
+---
+
+## 2026-11-19 · 登录过期自动暂停与重新登录后自动续传
+
+### 问题
+
+下载中登录过期时任务被标记 FAILED，一批任务会集体失败，用户只能逐个手动重试。
+
+### 方案
+
+- `AuthExpired` 先尝试强制续签一次（复用现有续签器）；续签失败才暂停。
+- **整队列暂停**（而非单批次）：登录凭据是全局的，只暂停某批次会让其他任务继续撞 AuthExpired。
+- 任务模型新增 `pausedByAuth` 标记，区分"因登录过期自动暂停"与"用户手动暂停"；只有前者会在重新登录后自动恢复。
+- 重新扫码登录成功后自动把这类任务改回 QUEUED 并重启队列（Desktop 立即；Android 通过 `ACTION_RESUME_AUTH_PAUSED` 重新拉起 Service）。
+
+### core
+
+- `DownloadTaskRecord.pausedByAuth: Boolean = false`（JSON 编解码，旧文件默认 false）。
+- 新增纯逻辑 `DownloadAuthPause`：`pauseAll` / `resumable` / `resumeAll` / `clearPausedByAuth`。
+- 测试 `DownloadAuthPauseTest` 6 例（TDD 先红灯后绿灯）。
+
+### 双端
+
+- Desktop：`downloadOne` 的 AuthExpired 不再写 FAILED；`runQueue` 每轮按 store 状态只启动 QUEUED，避免把已暂停任务重新拉起；扫码成功后 `resumeAll` 并等待旧队列退出再启动新队列；下载页新增暂停提示条。
+- Android：`runTask` 同样处理；`authPaused` 标志让调度器更新通知并停止前台服务；新增 `ACTION_RESUME_AUTH_PAUSED` 与 `resumeAuthPaused(context)`；MainActivity 登录成功后自动触发恢复；下载页新增提示条。
+
+### 验证
+
+- `DownloadAuthPauseTest` 6/6、`QQMusicSessionRefresherTest` 21/21 通过。
+- `:desktopApp:compileKotlin`、`:androidApp:assembleDebug` BUILD SUCCESSFUL。
+
+---
+
+## 2026-11-19 · 发布 v0.6 正式版
+
+- 版本号：Android `versionCode=6` / `versionName=0.6`；Desktop `packageVersion=0.6.0`。
+- Android：「`:androidApp:assembleRelease`」R8 优化 + `release.keystore` v2 正式签名，2.5MB。
+- Desktop：新增 `desktopApp/proguard-rules.pro`（抑制 okhttp 的 Conscrypt/OpenJSSE/GraalVM 可选依赖告警），并在 `build.gradle.kts` 的 `buildTypes.release.proguard` 接入；「`createReleaseDistributable`」「`packageReleaseMsi`」均通过。
+- 产物（`dist/`）：
+  - `QM-Download-v0.6-win-x64-portable.zip`（标准 zip，正斜杠路径，含 README）
+  - `QM-Download-v0.6-x64.msi`
+  - `QM-Download-v0.6.apk`
+  - `SHA256SUMS.txt`
+- 校验：APK v2 签名（CN=QM-Download）、versionCode=6、versionName=0.6；便携包内含 `DownloadAuthPause` / `QQMusicSessionRefresher` / `PlaylistPaging` / `ByteRateLimiter` / `DownloadBatch` 等 13 个新类；正式版启动冒烟测试通过（进程驻留响应）。
+- 文档：README 更新为 v0.6 并更正能力来源为 MeloX-Android；`docs/RELEASE.md` 重写为 v0.6 发布记录。

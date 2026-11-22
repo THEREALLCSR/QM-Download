@@ -61,12 +61,16 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Request
+import java.util.UUID
 import moe.ouom.qmdownload.core.auth.QQMusicQrLoginClient
 import moe.ouom.qmdownload.core.auth.QQMusicQrLoginSession
 import moe.ouom.qmdownload.core.auth.QQMusicQrLoginState
 import moe.ouom.qmdownload.core.auth.parseQQMusicCookie
+import moe.ouom.qmdownload.core.download.DownloadBatch
+import moe.ouom.qmdownload.core.download.DownloadBatchPaths
 import moe.ouom.qmdownload.core.download.DownloadTaskRecord
 import moe.ouom.qmdownload.core.download.DownloadTaskStatus
+import moe.ouom.qmdownload.core.library.PlaylistPaging
 import moe.ouom.qmdownload.core.link.QQMusicShareLinkParser
 import moe.ouom.qmdownload.core.model.QQMusicAccountProfile
 import moe.ouom.qmdownload.core.model.QQMusicPlaylist
@@ -127,9 +131,12 @@ private fun QmApp(app: QmApplication) {
     var shareError by remember { mutableStateOf<String?>(null) }
     var shareLoading by remember { mutableStateOf(false) }
     var tasks by remember { mutableStateOf(app.taskStore.load()) }
+    var batches by remember { mutableStateOf(app.downloadBatchStore.load()) }
     var maxConcurrent by remember {
         mutableStateOf(preferences.getInt("maxConcurrent", 2).coerceIn(1, 6))
     }
+    // 限速持久化值（KB/s，0=不限）；启动时同步到共享限速器
+    var speedLimitKbps by remember { mutableStateOf(preferences.getInt("speedLimitKbps", 0)) }
     var tab by remember { mutableStateOf(AndroidTab.LIBRARY) }
     val pendingCount = tasks.count { it.isPending() }
     val scope = rememberCoroutineScope()
@@ -160,6 +167,29 @@ private fun QmApp(app: QmApplication) {
         return granted
     }
 
+    // 前台续签复查间隔：6 小时。是否真正续签由 ensureSessionFresh 依据 keyst 年龄决定。
+    val periodicRefreshIntervalMs = 6 * 60 * 60 * 1000L
+
+    /**
+     * 检查并（按需）续签登录态，启动续签与前台定时复查共用此逻辑。
+     *
+     * 真正的续签由 [QmApplication.ensureSessionFresh] 统一完成（内部 Mutex 串行化，
+     * 与 DownloadService 的 AuthExpired 兜底共用同一入口）；这里只负责把结果同步到
+     * Compose 内存 session 并给出友好提示。
+     * 失败降级：QmApplication 已保留原 session 并记日志，此处无需额外处理。
+     */
+    suspend fun ensureSessionFresh(force: Boolean = false) {
+        val refreshed = app.ensureSessionFresh(force)
+        if (refreshed) {
+            app.sessionStore.load()?.let { session = it }
+            android.widget.Toast.makeText(
+                context,
+                "登录态已自动续签",
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
+
     suspend fun refresh() {
         val current = session ?: return
         loading = true
@@ -176,8 +206,21 @@ private fun QmApp(app: QmApplication) {
     }
 
     LaunchedEffect(Unit) {
+        // 启动即检查并续签一次（失败降级，不阻塞进入主界面）；前台每 6 小时复查一次。
+        // ensureSessionFresh 每次都读最新 store，故此处只启动一次循环即可覆盖后续扫码登录的场景。
+        ensureSessionFresh()
+        while (true) {
+            delay(periodicRefreshIntervalMs)
+            ensureSessionFresh()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        // 启动时按持久化值设置一次全局限速，之后由下载页下拉实时修改
+        app.rateLimiter.setRate(speedLimitKbps * 1024L)
         while (true) {
             tasks = app.taskStore.load()
+            batches = app.downloadBatchStore.load()
             delay(1_000)
         }
     }
@@ -228,6 +271,13 @@ private fun QmApp(app: QmApplication) {
                         val parsed = parseQQMusicCookie(state.cookie)
                         app.sessionStore.save(parsed)
                         session = parsed
+                        // 重新登录成功：若存在因登录过期暂停的任务，自动恢复并继续下载
+                        val hasAuthPaused = app.taskStore.load().any {
+                            it.status == DownloadTaskStatus.PAUSED && it.pausedByAuth
+                        }
+                        if (hasAuthPaused) {
+                            DownloadService.resumeAuthPaused(context)
+                        }
                         break
                     }
                     QQMusicQrLoginState.Scanned -> qrStatus = "已扫码，请在手机上确认"
@@ -270,8 +320,13 @@ private fun QmApp(app: QmApplication) {
             selectedSongMids = emptySet()
             scope.launch {
                 loading = true
+                error = null
                 runCatching {
-                    tracks = app.library.playlistTracksPage(playlist.id).tracks
+                    // 完整加载整首歌单（按 total 翻页 + songMid 去重），全选才不会被单页 99 首封顶
+                    tracks = app.library.allPlaylistTracks(playlist.id)
+                    if (tracks.size >= PlaylistPaging.MAX_TRACKS) {
+                        error = "歌单较大，已按上限加载 ${tracks.size} 首"
+                    }
                 }.onFailure { error = it.message }
                 loading = false
             }
@@ -311,17 +366,21 @@ private fun QmApp(app: QmApplication) {
                 shareLoading = true
                 shareError = null
                 runCatching {
-                    val page = app.library.playlistTracksPage(playlistId)
+                    // 分享歌单同样完整翻页加载，避免只能选到第一页的 99 首
+                    val loaded = app.library.allPlaylistTracks(playlistId)
                     selected = QQMusicPlaylist(
                         id = playlistId,
                         dirId = 0L,
                         title = "分享歌单 $playlistId",
                         coverUrl = null,
-                        trackCount = page.total,
+                        trackCount = loaded.size,
                         isOwn = false,
                     )
-                    tracks = page.tracks
+                    tracks = loaded
                     selectedSongMids = emptySet()
+                    if (loaded.size >= PlaylistPaging.MAX_TRACKS) {
+                        shareError = "歌单较大，已按上限加载 ${loaded.size} 首"
+                    }
                 }.onFailure { shareError = it.message }
                 shareLoading = false
             }
@@ -339,8 +398,20 @@ private fun QmApp(app: QmApplication) {
                 downloadStatus = "请允许通知权限后重试"
                 return@HomeScreen
             }
-            DownloadService.start(context, chosen, tree, qualityKey)
+            // 一次提交 = 一个批次；Service 负责把批次与任务落库，Activity 不双写
+            val playlistTitle = selected?.title ?: "未命名歌单"
+            val batch = DownloadBatch(
+                id = UUID.randomUUID().toString(),
+                playlistId = selected?.id,
+                playlistTitle = playlistTitle,
+                subDir = DownloadBatchPaths.subDirName(playlistTitle),
+                rootTarget = tree.toString(),
+                quality = qualityKey,
+                total = chosen.size,
+            )
+            DownloadService.start(context, batch, chosen, tree, qualityKey)
             tasks = app.taskStore.load()
+            batches = app.downloadBatchStore.load()
             downloadStatus = "已提交后台下载"
             tab = AndroidTab.DOWNLOADS
         },
@@ -361,10 +432,21 @@ private fun QmApp(app: QmApplication) {
             } else {
                 AndroidDownloadsScreen(
                     tasks = tasks,
+                    batches = batches,
+                    authPausedCount = tasks.count {
+                        it.status == DownloadTaskStatus.PAUSED && it.pausedByAuth
+                    },
                     maxConcurrent = maxConcurrent,
+                    speedLimitKbps = speedLimitKbps,
                     onMaxConcurrentChange = {
                         maxConcurrent = it
                         preferences.edit().putInt("maxConcurrent", it).apply()
+                    },
+                    onSpeedLimitChange = { kbps ->
+                        speedLimitKbps = kbps
+                        // 立即生效：Service 与 manager 共用 application 的同一个限速器
+                        app.rateLimiter.setRate(kbps * 1024L)
+                        preferences.edit().putInt("speedLimitKbps", kbps).apply()
                     },
                     onPauseAll = { DownloadService.pauseAll(context) },
                     onResumeAll = { DownloadService.resumeAll(context) },
@@ -375,6 +457,27 @@ private fun QmApp(app: QmApplication) {
                         DownloadService.removeTask(context, id)
                         app.taskStore.remove(id)
                         tasks = app.taskStore.load()
+                    },
+                    onPauseBatch = { id -> DownloadService.pauseBatch(context, id) },
+                    onResumeBatch = { id -> DownloadService.resumeBatch(context, id) },
+                    onRetryBatch = { id -> DownloadService.retryBatch(context, id) },
+                    onRemoveBatch = { id ->
+                        DownloadService.removeBatch(context, id)
+                        tasks = app.taskStore.load()
+                        batches = app.downloadBatchStore.load()
+                    },
+                    onOpenBatchFolder = { batch ->
+                        // SAF 只授权整个 tree，无法直接定位子目录；这里提示目标路径文本
+                        val path = if (batch.subDir.isNotBlank()) {
+                            "${batch.rootTarget} / ${batch.subDir}"
+                        } else {
+                            batch.rootTarget
+                        }
+                        android.widget.Toast.makeText(
+                            context,
+                            "下载目录：$path",
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
                     },
                     onBack = { tab = AndroidTab.LIBRARY },
                 )

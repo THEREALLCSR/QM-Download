@@ -156,6 +156,21 @@ class QQMusicLibraryRepository(
         QQMusicPlaylistTracks(tracks = tracks, total = total)
     }
 
+    /**
+     * 完整加载整个歌单：按服务端 total 逐页翻页，按 songMid 去重并保持顺序。
+     *
+     * 供双端“全选/整歌单下载”使用；原 [playlistTracksPage] 保持为单页接口以兼容。
+     * 翻页过程带空页/无新增/不推进/页数与曲目数上限保护，不会无限循环。
+     */
+    suspend fun allPlaylistTracks(
+        playlistId: String,
+        pageSize: Int = PlaylistPaging.DEFAULT_PAGE_SIZE,
+    ): List<QQMusicTrack> = loadAllPlaylistTracks(
+        playlistId = playlistId,
+        fetchPage = { id, begin, limit -> playlistTracksPage(id, begin, limit) },
+        pageSize = pageSize,
+    )
+
     private fun requireSession(): QQMusicSession =
         sessionProvider()?.takeIf { it.isLoggedIn }
             ?: throw QmError.AuthExpired()

@@ -21,10 +21,14 @@ compose.desktop {
         nativeDistributions {
             targetFormats(org.jetbrains.compose.desktop.application.dsl.TargetFormat.Msi)
             packageName = "QM-Download"
-            packageVersion = "0.5.0"
+            packageVersion = "0.6.0"
             description = "QQ Music playlist downloader"
             vendor = "QM-Download"
             copyright = "© 2026 QM-Download"
+        }
+        // 正式版启用 ProGuard；规则见 desktopApp/proguard-rules.pro
+        buildTypes.release.proguard {
+            configurationFiles.from(project.file("proguard-rules.pro"))
         }
     }
 }
